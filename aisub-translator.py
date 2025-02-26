@@ -72,6 +72,50 @@ def extract_leading_formatting(text):
 def postprocess_translation(translation_text):
     return re.sub(r'\s*\{\(.*?\)\}', '', translation_text)
 
+def translate_line_ollama(text, original_language, target_language, ollama_url, model, temperature=1.0):
+    """
+    Uses Ollama (LM Studio) to translate a text locally.
+    """
+    system_prompt = (
+        f"Translate the following subtitle text from {original_language} to {target_language}. "
+        "Translate only the plain text and do not include any formatting codes. "
+        "Do not add any extra commentary. Your output must contain only the translation of the provided text."
+    )
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": text}
+        ],
+        "temperature": temperature
+    }
+
+    url = f"{ollama_url}/v1/chat/completions"
+
+    try:
+        response = requests.post(url, json=payload, timeout=30)
+        response.raise_for_status()
+
+        data = response.json()
+        try:
+            translated_text = data["choices"][0]["message"]["content"].strip()
+            return translated_text
+        except (KeyError, IndexError) as e:
+            print(f"Invalid response from Ollama: {data} ({e})")
+            return None
+
+    except requests.exceptions.Timeout:
+        print("Request timed out. Ollama is taking too long to respond.")
+        return None
+    except requests.exceptions.ConnectionError:
+        print(f"Failed to connect to Ollama at {url}. Make sure the server is running.")
+        return None
+    except requests.exceptions.RequestException as e:
+        print(f"Ollama request error: {e}")
+        return None
+
+
 def translate_line_openai(client, text, episode_synopsis, previous_context, original_language, target_language, model, extra_headers=None, temperature=1.3):
     formatting_codes, plain_text = extract_leading_formatting(text)
     parts = split_text_with_formatting(plain_text)
@@ -253,31 +297,16 @@ def main():
     deepseek_model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
     openrouter_model = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-chat:free")
     mistral_model = os.getenv("MISTRAL_MODEL", "mistral-small-latest")
-    available_keys = {}
-    if openai_key:
-        available_keys["openai"] = openai_key
-    if claude_key:
-        available_keys["claude"] = claude_key
-    if deepseek_key:
-        available_keys["deepseek"] = deepseek_key
-    if openrouter_key:
-        available_keys["openrouter"] = openrouter_key
-    if mistral_key:
-        available_keys["mistral"] = mistral_key
-    if not available_keys:
-        logger.error("No API keys found in .env file. Please set at least one of OPENAI_API_KEY, CLAUDE_API_KEY, DEEPSEEK_API_KEY, OPENROUTER_API_KEY, or MISTRAL_API_KEY.")
-        return
+    ollama_model = os.getenv("OLLAMA_MODEL", "llama-3.2-3b-instruct")
+    ollama_url = os.getenv("OLLAMA_URL", "http://127.0.0.1:1234")
+
     parser = argparse.ArgumentParser(
         description="Translate subtitle files (.ass, .srt) line-by-line with context using an AI API. "
                     "Supports OpenAI, Claude, DeepSeek, OpenRouter, and Mistral."
     )
     parser.add_argument("input_files", nargs='+', help="Path to input subtitle files (.ass or .srt)")
     parser.add_argument("--target-language", required=True, help="Target language code (e.g., 'en')")
-    parser.add_argument(
-        "--ai",
-        choices=["openai", "claude", "deepseek", "openrouter", "mistral"],
-        help="Which AI provider to use (openai, claude, deepseek, openrouter, mistral)"
-    )
+    parser.add_argument("--ai", choices=["openai", "claude", "deepseek", "openrouter", "mistral", "ollama"], help="Which AI provider to use ollama or online")
     parser.add_argument("--model", help="Specify the model to use, overrides default from .env")
     parser.add_argument("--temperature", type=float, default=1.3, help="Set the temperature for translation (0.0 to 2.0)")
     parser.add_argument("--context", help="Episode synopsis for the current film/episode (already translated)")
@@ -296,6 +325,24 @@ def main():
             http.client.HTTPConnection.debuglevel = 0
         except Exception:
             pass
+    
+    available_keys = {}
+    if openai_key:
+        available_keys["openai"] = openai_key
+    if claude_key:
+        available_keys["claude"] = claude_key
+    if deepseek_key:
+        available_keys["deepseek"] = deepseek_key
+    if openrouter_key:
+        available_keys["openrouter"] = openrouter_key
+    if mistral_key:
+        available_keys["mistral"] = mistral_key
+    if args.ai == "ollama":
+        available_keys["ollama"] = "local"
+    if not available_keys:
+        logger.error("No API keys found in .env file. Please set at least one of OPENAI_API_KEY, CLAUDE_API_KEY, DEEPSEEK_API_KEY, OPENROUTER_API_KEY, or MISTRAL_API_KEY.")
+        return
+   
     if len(available_keys) == 1:
         ai_choice = next(iter(available_keys))
         logger.info(f"Only {ai_choice} API key found. Using {ai_choice}.")
@@ -338,6 +385,12 @@ def main():
             model = args.model if args.model else openrouter_model
         elif ai_choice == "mistral":
             model = args.model if args.model else mistral_model
+        elif ai_choice == "ollama":
+            model = args.model if args.model else ollama_model
+            translate_func = lambda text, ep_syn, prev_ctx, orig_lang, tgt_lang: translate_line_ollama(
+                text, orig_lang, tgt_lang, ollama_url=ollama_url, model=model, temperature=args.temperature
+            )
+
         if ai_choice in ["openai", "deepseek", "openrouter"]:
             if ai_choice == "openai":
                 client = OpenAI(api_key=available_keys["openai"], base_url="https://api.openai.com")
